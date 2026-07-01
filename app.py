@@ -1,7 +1,10 @@
 """
-Server Flask Final — Sistem Peringatan Dini Kualitas Air Ikan Discus
-Database  : Supabase (PostgreSQL)
-Deploy    : Render.com
+Server Flask Final v3 — Sistem Peringatan Dini Kualitas Air Ikan Discus
+Perbaikan:
+  - Notifikasi inisialisasi sistem saat server hidup
+  - Notifikasi aktuator ON/OFF
+  - Cooldown per-status bukan per-label (Bahaya selalu kirim)
+  - Supabase RLS sudah ditangani di panduan
 """
 
 from flask import Flask, request, jsonify
@@ -21,8 +24,15 @@ SUPABASE_URL   = "https://dedoyprhqrontosullhb.supabase.co"
 SUPABASE_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRlZG95cHJocXJvbnRvc3VsbGhiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI2MTEyMDQsImV4cCI6MjA5ODE4NzIwNH0.kKGRsFGOSY-zAWADvESaFUgHryf14RYcLbSwt0T_W5M"
 SUPABASE_TABLE = "sensor_log"
 
-COOLDOWN_DETIK = 300
-MODEL_FILE     = "model.pkl"
+# Cooldown per label (detik)
+# Bahaya = 0 → selalu kirim setiap deteksi
+# Waspada = 120 → kirim maksimal tiap 2 menit
+COOLDOWN = {
+    "Bahaya":  0,    # selalu kirim setiap ada deteksi Bahaya
+    "Waspada": 120   # kirim tiap 2 menit jika terus Waspada
+}
+
+MODEL_FILE = "model.pkl"
 
 # ================================================================
 # LOGGING
@@ -47,10 +57,57 @@ except Exception as e:
     model, encoder = None, None
 
 # ================================================================
-# STATE COOLDOWN NOTIFIKASI
+# STATE
 # ================================================================
-last_notif_time = {}
-notif_count     = {}
+last_notif_time  = {}
+notif_count      = {}
+status_aktuator  = {
+    "pompa_kuras": False,
+    "pompa_isi":   False,
+    "heater":      False,
+    "filter":      False
+}
+
+# ================================================================
+# FUNGSI KIRIM TELEGRAM (generik)
+# ================================================================
+def kirim_telegram_pesan(pesan):
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id":    CHAT_ID,
+            "text":       pesan,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+        if resp.status_code == 200:
+            logger.info("[Telegram] Pesan terkirim")
+            return True
+        else:
+            logger.error(f"[Telegram] Gagal: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"[Telegram] Error: {e}")
+        return False
+
+# ================================================================
+# NOTIFIKASI INISIALISASI — kirim saat server pertama hidup
+# ================================================================
+def notif_sistem_hidup():
+    waktu = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    pesan = (
+        f"✅ *SISTEM MONITORING AKTIF*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🐟 Monitoring kualitas air ikan discus\n"
+        f"🤖 Model XGBoost: *loaded*\n"
+        f"🗄 Database: *Supabase connected*\n"
+        f"⏱ Interval baca: *2 menit*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 Waktu aktif: {waktu}"
+    )
+    kirim_telegram_pesan(pesan)
+
+# Kirim notifikasi sistem hidup saat server start
+notif_sistem_hidup()
 
 # ================================================================
 # FUNGSI SIMPAN KE SUPABASE
@@ -86,16 +143,18 @@ def simpan_supabase(ts, suhu, ph, turb, label, prob_dict):
         return False
 
 # ================================================================
-# FUNGSI KIRIM TELEGRAM
+# FUNGSI KIRIM NOTIFIKASI KONDISI AIR
 # ================================================================
-def kirim_telegram(label, suhu, ph, turb, prob):
+def kirim_notif_kondisi(label, suhu, ph, turb, prob):
     global last_notif_time
 
     sekarang = datetime.now().timestamp()
     terakhir = last_notif_time.get(label, 0)
+    cooldown = COOLDOWN.get(label, 120)
 
-    if sekarang - terakhir < COOLDOWN_DETIK:
-        sisa = int(COOLDOWN_DETIK - (sekarang - terakhir))
+    # Cek cooldown
+    if cooldown > 0 and (sekarang - terakhir) < cooldown:
+        sisa = int(cooldown - (sekarang - terakhir))
         logger.info(f"[Telegram] Cooldown {label} — {sisa}s tersisa")
         return False
 
@@ -120,23 +179,41 @@ def kirim_telegram(label, suhu, ph, turb, prob):
         f"⚡ Alert ke-{notif_count[label]}"
     )
 
-    try:
-        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id":    CHAT_ID,
-            "text":       pesan,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-        if resp.status_code == 200:
-            last_notif_time[label] = sekarang
-            logger.info(f"[Telegram] Alert {label} terkirim")
-            return True
-        else:
-            logger.error(f"[Telegram] Gagal: {resp.text}")
-            return False
-    except Exception as e:
-        logger.error(f"[Telegram] Error: {e}")
-        return False
+    hasil = kirim_telegram_pesan(pesan)
+    if hasil:
+        last_notif_time[label] = sekarang
+    return hasil
+
+# ================================================================
+# FUNGSI NOTIFIKASI AKTUATOR
+# ================================================================
+def notif_aktuator(aktuator_baru):
+    global status_aktuator
+
+    perubahan = []
+    nama_map  = {
+        "pompa_kuras": "Pompa Kuras",
+        "pompa_isi":   "Pompa Isi",
+        "heater":      "Heater",
+        "filter":      "Filter"
+    }
+
+    for key, val in aktuator_baru.items():
+        if val != status_aktuator.get(key, False):
+            status = "🟢 ON" if val else "🔴 OFF"
+            perubahan.append(f"  {nama_map.get(key, key)}: *{status}*")
+        status_aktuator[key] = val
+
+    if perubahan:
+        waktu_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        pesan = (
+            f"⚙️ *PERUBAHAN AKTUATOR*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(perubahan) +
+            f"\n━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {waktu_str}"
+        )
+        kirim_telegram_pesan(pesan)
 
 # ================================================================
 # ENDPOINT UTAMA — TERIMA DATA DARI ESP32
@@ -144,7 +221,7 @@ def kirim_telegram(label, suhu, ph, turb, prob):
 @app.route("/data", methods=["POST"])
 def terima_data():
 
-    # 1 — Ambil JSON dari ESP32
+    # 1 — Ambil JSON
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "error", "msg": "invalid JSON"}), 400
@@ -191,23 +268,29 @@ def terima_data():
         f"B:{prob_dict.get('Bahaya',0):.2f})"
     )
 
-    # 5 — Simpan ke Supabase (data sensor + hasil prediksi)
+    # 5 — Simpan ke Supabase
     simpan_supabase(ts, suhu, ph, turb, label, prob_dict)
 
-    # 6 — Tentukan aksi berdasarkan label
-    notif_terkirim = False
-    if label == "Waspada":
-        notif_terkirim = kirim_telegram(label, suhu, ph, turb, prob_dict)
-    elif label == "Bahaya":
-        notif_terkirim = kirim_telegram(label, suhu, ph, turb, prob_dict)
-
-    # 7 — Tentukan perintah aktuator untuk ESP32
+    # 6 — Tentukan perintah aktuator
     aktuator = {
         "pompa_kuras": label == "Bahaya",
         "pompa_isi":   label == "Bahaya",
         "heater":      suhu < 25.0,
         "filter":      label in ["Waspada", "Bahaya"]
     }
+
+    # 7 — Kirim notifikasi kondisi + notifikasi perubahan aktuator
+    notif_terkirim = False
+    if label in ["Waspada", "Bahaya"]:
+        notif_terkirim = kirim_notif_kondisi(
+            label, suhu, ph, turb, prob_dict
+        )
+        # Kirim notif perubahan aktuator jika ada yang berubah
+        notif_aktuator(aktuator)
+
+    else:
+        # Kondisi kembali Aman — kirim notif aktuator jika ada yang dimatikan
+        notif_aktuator(aktuator)
 
     # 8 — Kembalikan respons ke ESP32
     return jsonify({
@@ -220,7 +303,33 @@ def terima_data():
     }), 200
 
 # ================================================================
-# ENDPOINT STATUS SERVER
+# ENDPOINT AKTUATOR MANUAL DARI BLYNK / USER
+# Endpoint ini dipanggil jika kamu ingin log aktuator manual
+# ================================================================
+@app.route("/aktuator", methods=["POST"])
+def aktuator_manual():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error"}), 400
+
+    nama   = data.get("nama", "unknown")
+    state  = data.get("state", False)
+    waktu  = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    status = "🟢 ON" if state else "🔴 OFF"
+
+    pesan = (
+        f"🖐 *KONTROL MANUAL*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ {nama}: *{status}*\n"
+        f"👤 Dikendalikan manual via Blynk\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {waktu}"
+    )
+    kirim_telegram_pesan(pesan)
+    return jsonify({"status": "ok"}), 200
+
+# ================================================================
+# ENDPOINT STATUS
 # ================================================================
 @app.route("/status", methods=["GET"])
 def status():
