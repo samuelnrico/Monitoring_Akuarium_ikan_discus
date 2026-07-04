@@ -39,24 +39,35 @@ SUPABASE_TABLE = "sensor_log"
 MODEL_FILE = "model.pkl"
 
 # ----------------------------------------------------------------
-# AMBANG BATAS (RULE-BASED) — sesuaikan dengan kebutuhan ikan discus
-# Threshold "keras" = kondisi bahaya (memicu aktuator)
-# Threshold "lunak" = kondisi mulai menyimpang (hanya peringatan)
+# AMBANG BATAS (RULE-BASED) — SESUAI TABEL LAPORAN
+#
+#   Parameter   | Aman        | Waspada                | Bahaya
+#   Suhu (°C)   | 25.0-31.0   | 20.0-24.9 / 31.1-33.0  | <20.0 / >33.0
+#   pH          | 6.0-7.0     | 5.5-5.9 / 7.1-7.5      | <5.5  / >7.5
+#   Turbidity   | 0-25        | ~25                    | >25
+#
+# Aktuator hanya diaktifkan pada level BAHAYA per-parameter.
+# Kondisi Waspada -> hanya peringatan, tidak menyalakan aktuator.
 # ----------------------------------------------------------------
-PH_ASAM          = 6.0    # pH < 6.0  -> terlalu asam  -> pompa basa
-PH_BASA          = 8.0    # pH > 8.0  -> terlalu basa  -> pompa asam
-PH_ASAM_WASPADA  = 6.5    # 6.0..6.5  -> mulai menyimpang (asam)
-PH_BASA_WASPADA  = 7.5    # 7.5..8.0  -> mulai menyimpang (basa)
+# pH
+PH_AMAN_MIN     = 6.0
+PH_AMAN_MAX     = 7.0
+PH_BAHAYA_ASAM  = 5.5      # pH < 5.5  -> terlalu asam -> pompa BASA
+PH_BAHAYA_BASA  = 7.5      # pH > 7.5  -> terlalu basa -> pompa ASAM
 
-SUHU_MIN         = 28.0   # < 28.0 -> terlalu dingin -> heater
-SUHU_MAX         = 31.0   # > 31.0 -> terlalu panas (tidak ada cooler)
-SUHU_MIN_WASPADA = 28.5
-SUHU_MAX_WASPADA = 30.5
+# Suhu
+SUHU_AMAN_MIN      = 25.0
+SUHU_AMAN_MAX      = 31.0
+SUHU_BAHAYA_DINGIN = 20.0  # < 20 -> terlalu dingin -> heater
+SUHU_BAHAYA_PANAS  = 33.0  # > 33 -> terlalu panas (tidak ada cooler)
 
-TURB_MAX         = 40.0   # > 40 -> melewati batas
-TURB_WASPADA     = 30.0   # > 30 -> mulai naik
+# Turbidity
+TURB_BAHAYA        = 25.0  # > 25 -> melewati batas (tidak ada aktuator di HW ini)
 
-DOSING_DETIK     = 5      # durasi pulsa pompa buffer (detik) — dieksekusi ESP32
+DOSING_DETIK       = 5     # durasi pulsa pompa buffer (detik) — dieksekusi ESP32
+
+# Tingkat keparahan untuk membandingkan status
+RANK = {"Aman": 0, "Waspada": 1, "Bahaya": 2}
 
 # Cooldown notifikasi kondisi (detik)
 #   Bahaya  = 0   -> selalu kirim setiap deteksi (sesuai kebutuhanmu)
@@ -183,34 +194,62 @@ def pesan_aktuator_off(nama_aktuator):
 notif_sistem_aktif()
 
 # ================================================================
-# DETEKSI PENYEBAB SPESIFIK (RULE-BASED)
-# XGBoost hanya memberi status; fungsi ini memakai nilai mentah
-# untuk menentukan penyebab + aktuator target.
-# Return: (penyebab, aktuator_key, nama_aktuator)
-#   aktuator_key = None  -> tidak ada aktuator (hanya peringatan)
+# EVALUASI KONDISI (RULE-BASED, MULTI-PARAMETER)
+# XGBoost hanya memberi STATUS. Fungsi ini memeriksa SETIAP parameter
+# secara independen memakai ambang tabel laporan, sehingga:
+#   - beberapa masalah bisa dilaporkan sekaligus (mis. pH + turbidity)
+#   - beberapa aktuator bisa hidup bersamaan (mis. pompa + heater)
+#   - satu masalah tidak "menendang" masalah lain
+# Return: (penyebab_str, aktuator_dict, aksi_list, status_rule)
 # ================================================================
-def deteksi_penyebab(suhu, ph, turb, label):
-    # ---- Threshold keras (kondisi bahaya, memicu aktuator) ----
-    if ph < PH_ASAM:
-        return ("pH terlalu asam", "pompa_basa", "Pompa buffer basa")
-    if ph > PH_BASA:
-        return ("pH terlalu basa", "pompa_asam", "Pompa buffer asam")
-    if suhu < SUHU_MIN:
-        return ("Suhu terlalu dingin", "heater", "Heater")
-    if suhu > SUHU_MAX:
-        return ("Suhu terlalu panas", None, "-")
-    if turb > TURB_MAX:
-        return ("Turbidity melewati batas", None, "-")
+def evaluasi_kondisi(suhu, ph, turb):
+    penyebab = []   # daftar semua masalah terdeteksi
+    aksi     = []   # daftar nama aktuator yang diaktifkan
+    aktuator = {"pompa_asam": False, "pompa_basa": False, "heater": False}
+    rank     = 0    # 0=Aman, 1=Waspada, 2=Bahaya
 
-    # ---- Threshold lunak (mulai menyimpang, hanya peringatan) ----
-    if ph <= PH_ASAM_WASPADA or ph >= PH_BASA_WASPADA:
-        return ("pH mulai menyimpang", None, "-")
-    if suhu <= SUHU_MIN_WASPADA or suhu >= SUHU_MAX_WASPADA:
-        return ("Suhu mulai menyimpang", None, "-")
-    if turb >= TURB_WASPADA:
-        return ("Turbidity mulai menyimpang", None, "-")
+    # ---------------- pH ----------------
+    if ph > PH_BAHAYA_BASA:              # > 7.5  -> BAHAYA (basa)
+        penyebab.append("pH terlalu basa")
+        aktuator["pompa_asam"] = True
+        aksi.append("Pompa buffer asam")
+        rank = max(rank, 2)
+    elif ph < PH_BAHAYA_ASAM:            # < 5.5  -> BAHAYA (asam)
+        penyebab.append("pH terlalu asam")
+        aktuator["pompa_basa"] = True
+        aksi.append("Pompa buffer basa")
+        rank = max(rank, 2)
+    elif ph > PH_AMAN_MAX:               # 7.1 - 7.5 -> WASPADA
+        penyebab.append("pH mulai menyimpang (cenderung basa)")
+        rank = max(rank, 1)
+    elif ph < PH_AMAN_MIN:               # 5.5 - 5.9 -> WASPADA
+        penyebab.append("pH mulai menyimpang (cenderung asam)")
+        rank = max(rank, 1)
 
-    return ("Parameter mendekati batas normal", None, "-")
+    # ---------------- Suhu ----------------
+    if suhu > SUHU_BAHAYA_PANAS:         # > 33 -> BAHAYA (panas, tak ada cooler)
+        penyebab.append("Suhu terlalu panas")
+        rank = max(rank, 2)
+    elif suhu < SUHU_BAHAYA_DINGIN:      # < 20 -> BAHAYA (dingin)
+        penyebab.append("Suhu terlalu dingin")
+        aktuator["heater"] = True
+        aksi.append("Heater")
+        rank = max(rank, 2)
+    elif suhu > SUHU_AMAN_MAX:           # 31.1 - 33 -> WASPADA
+        penyebab.append("Suhu mulai menyimpang (panas)")
+        rank = max(rank, 1)
+    elif suhu < SUHU_AMAN_MIN:           # 20 - 24.9 -> WASPADA
+        penyebab.append("Suhu mulai menyimpang (dingin)")
+        rank = max(rank, 1)
+
+    # ---------------- Turbidity ----------------
+    if turb > TURB_BAHAYA:               # > 25 -> BAHAYA (tak ada aktuator)
+        penyebab.append("Turbidity melewati batas")
+        rank = max(rank, 2)
+
+    status_rule  = ["Aman", "Waspada", "Bahaya"][rank]
+    penyebab_str = "; ".join(penyebab) if penyebab else "Semua parameter normal"
+    return penyebab_str, aktuator, aksi, status_rule
 
 # ================================================================
 # NOTIFIKASI KONDISI (dengan cooldown per label)
@@ -321,40 +360,38 @@ def terima_data():
         logger.error(f"Prediksi error: {e}")
         return jsonify({"status": "error", "msg": str(e)}), 500
 
-    # 5 — Deteksi penyebab spesifik (RULE-BASED)
-    penyebab, akt_key, akt_nama = deteksi_penyebab(suhu, ph, turb, label)
+    # 5 — Evaluasi kondisi (RULE-BASED multi-parameter, sesuai tabel laporan)
+    #     XGBoost -> status prediksi; aturan -> penyebab + aktuator + arah.
+    penyebab, aktuator, aksi_list, status_rule = evaluasi_kondisi(suhu, ph, turb)
+
+    # Status final = tingkat PALING PARAH antara prediksi XGBoost & aturan,
+    # supaya sistem tidak pernah UNDER-warning.
+    status = label if RANK.get(label, 0) >= RANK[status_rule] else status_rule
 
     logger.info(
-        f"[{ts}] suhu={suhu} pH={ph} turb={turb} -> {label} | penyebab={penyebab} "
-        f"(A:{prob_dict.get('Aman',0):.2f} "
-        f"W:{prob_dict.get('Waspada',0):.2f} "
-        f"B:{prob_dict.get('Bahaya',0):.2f})"
+        f"[{ts}] suhu={suhu} pH={ph} turb={turb} | XGBoost={label} "
+        f"aturan={status_rule} -> final={status} | penyebab={penyebab}"
     )
 
-    # 6 — Simpan ke Supabase
+    # 6 — Simpan ke Supabase (label XGBoost tetap disimpan sebagai prediksi)
     simpan_supabase(ts, suhu, ph, turb, label, prob_dict)
 
-    # 7 — Tentukan aktuator. Aktuator hanya aktif saat BAHAYA +
-    #     threshold keras terlewati (deteksi_penyebab memberi akt_key).
-    aktuator = {"pompa_asam": False, "pompa_basa": False, "heater": False}
-    if label == "Bahaya" and akt_key in aktuator:
-        aktuator[akt_key] = True
+    # 7 — Notifikasi kondisi
+    if status == "Bahaya":
+        aksi = (", ".join(aksi_list) + " diaktifkan") if aksi_list \
+               else "Sistem mengirim peringatan kepada pengguna"
+        kirim_notif_kondisi("Bahaya", suhu, ph, turb, penyebab, aksi)
+    elif status == "Waspada":
+        kirim_notif_kondisi("Waspada", suhu, ph, turb, penyebab, None)
 
-    # 8 — Notifikasi kondisi (Waspada/Bahaya)
-    if label == "Bahaya":
-        aksi = f"{akt_nama} diaktifkan" if akt_key else "Sistem mengirim peringatan kepada pengguna"
-        kirim_notif_kondisi(label, suhu, ph, turb, penyebab, aksi)
-    elif label == "Waspada":
-        kirim_notif_kondisi(label, suhu, ph, turb, penyebab, None)
-
-    # 9 — Notifikasi aktuator (hanya saat transisi ON/OFF)
+    # 8 — Notifikasi aktuator (hanya saat transisi ON/OFF)
     proses_notif_aktuator(aktuator, penyebab)
 
-    # 10 — Respons ke ESP32
-    #      dosing_detik = durasi pulsa pompa buffer yang dieksekusi ESP32
+    # 9 — Respons ke ESP32
     return jsonify({
         "status":       "ok",
-        "prediksi":     label,
+        "prediksi":     label,        # hasil XGBoost (untuk dashboard/thesis)
+        "status_final": status,       # status yang benar-benar dipakai sistem
         "probabilitas": {k: round(v, 4) for k, v in prob_dict.items()},
         "penyebab":     penyebab,
         "aktuator":     aktuator,
