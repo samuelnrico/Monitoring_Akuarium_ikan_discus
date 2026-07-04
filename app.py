@@ -1,10 +1,22 @@
 """
-Server Flask Final v3 — Sistem Peringatan Dini Kualitas Air Ikan Discus
-Perbaikan:
-  - Notifikasi inisialisasi sistem saat server hidup
-  - Notifikasi aktuator ON/OFF
-  - Cooldown per-status bukan per-label (Bahaya selalu kirim)
-  - Supabase RLS sudah ditangani di panduan
+Server Flask FINAL (Revisi) — Sistem Peringatan Dini Kualitas Air Ikan Discus
+================================================================
+Perubahan utama dibanding versi sebelumnya:
+  1. XGBoost hanya dipakai untuk STATUS (Aman/Waspada/Bahaya).
+     Penyebab spesifik (pH asam/basa, suhu dingin/panas, turbidity)
+     ditentukan oleh RULE-BASED THRESHOLD pada nilai sensor mentah,
+     karena model klasifikasi tidak tahu ARAH penyimpangan.
+  2. Logika pompa buffer diperbaiki (netralisasi):
+       - pH terlalu ASAM  -> Pompa buffer BASA aktif  (menaikkan pH)
+       - pH terlalu BASA  -> Pompa buffer ASAM aktif  (menurunkan pH)
+  3. Pompa bekerja DOSING: nyala singkat (default 5 detik) tiap
+     pembacaan. Kalau 2 menit lagi masih lewat batas -> dosing lagi.
+     ESP32 yang mengeksekusi pulsa 5 detiknya (field "dosing_detik").
+  4. Format notifikasi Telegram disamakan dengan laporan
+     (SISTEM AKTIF / WASPADA / BAHAYA / AKTUATOR AKTIF / NONAKTIF).
+  5. Notifikasi aktuator hanya dikirim saat TERJADI PERUBAHAN status
+     logis aktuator (mulai dosing / berhenti dosing), bukan tiap pulsa.
+================================================================
 """
 
 from flask import Flask, request, jsonify
@@ -24,15 +36,42 @@ SUPABASE_URL   = "https://dedoyprhqrontosullhb.supabase.co"
 SUPABASE_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRlZG95cHJocXJvbnRvc3VsbGhiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI2MTEyMDQsImV4cCI6MjA5ODE4NzIwNH0.kKGRsFGOSY-zAWADvESaFUgHryf14RYcLbSwt0T_W5M"
 SUPABASE_TABLE = "sensor_log"
 
-# Cooldown per label (detik)
-# Bahaya = 0 → selalu kirim setiap deteksi
-# Waspada = 120 → kirim maksimal tiap 2 menit
+MODEL_FILE = "model.pkl"
+
+# ----------------------------------------------------------------
+# AMBANG BATAS (RULE-BASED) — sesuaikan dengan kebutuhan ikan discus
+# Threshold "keras" = kondisi bahaya (memicu aktuator)
+# Threshold "lunak" = kondisi mulai menyimpang (hanya peringatan)
+# ----------------------------------------------------------------
+PH_ASAM          = 6.0    # pH < 6.0  -> terlalu asam  -> pompa basa
+PH_BASA          = 8.0    # pH > 8.0  -> terlalu basa  -> pompa asam
+PH_ASAM_WASPADA  = 6.5    # 6.0..6.5  -> mulai menyimpang (asam)
+PH_BASA_WASPADA  = 7.5    # 7.5..8.0  -> mulai menyimpang (basa)
+
+SUHU_MIN         = 28.0   # < 28.0 -> terlalu dingin -> heater
+SUHU_MAX         = 31.0   # > 31.0 -> terlalu panas (tidak ada cooler)
+SUHU_MIN_WASPADA = 28.5
+SUHU_MAX_WASPADA = 30.5
+
+TURB_MAX         = 40.0   # > 40 -> melewati batas
+TURB_WASPADA     = 30.0   # > 30 -> mulai naik
+
+DOSING_DETIK     = 5      # durasi pulsa pompa buffer (detik) — dieksekusi ESP32
+
+# Cooldown notifikasi kondisi (detik)
+#   Bahaya  = 0   -> selalu kirim setiap deteksi (sesuai kebutuhanmu)
+#   Waspada = 120 -> maksimal tiap 2 menit
 COOLDOWN = {
-    "Bahaya":  0,    # selalu kirim setiap ada deteksi Bahaya
-    "Waspada": 120   # kirim tiap 2 menit jika terus Waspada
+    "Bahaya":  0,
+    "Waspada": 120
 }
 
-MODEL_FILE = "model.pkl"
+# Nama tampilan aktuator
+NAMA_AKTUATOR = {
+    "pompa_asam": "Pompa buffer asam",
+    "pompa_basa": "Pompa buffer basa",
+    "heater":     "Heater",
+}
 
 # ================================================================
 # LOGGING
@@ -48,7 +87,7 @@ logger = logging.getLogger(__name__)
 # ================================================================
 try:
     with open(MODEL_FILE, "rb") as f:
-        saved   = pickle.load(f)
+        saved = pickle.load(f)
     model   = saved["model"]
     encoder = saved["encoder"]
     logger.info(f"Model loaded — kelas: {list(encoder.classes_)}")
@@ -59,58 +98,157 @@ except Exception as e:
 # ================================================================
 # STATE
 # ================================================================
-last_notif_time  = {}
-notif_count      = {}
-status_aktuator  = {
-    "pompa_kuras": False,
-    "pompa_isi":   False,
-    "heater":      False,
-    "filter":      False
+last_notif_time = {}
+# Status LOGIS aktuator (True = sedang dosing/aktif). Dipakai untuk
+# mendeteksi transisi ON/OFF, bukan status pulsa fisik.
+status_aktuator = {
+    "pompa_asam": False,
+    "pompa_basa": False,
+    "heater":     False,
 }
 
 # ================================================================
 # FUNGSI KIRIM TELEGRAM (generik)
+# parse_mode HTML + <pre> supaya perataan kolom (spasi) rapi
 # ================================================================
-def kirim_telegram_pesan(pesan):
+def kirim_telegram_pesan(pesan, monospace=True):
     try:
+        teks = f"<pre>{pesan}</pre>" if monospace else pesan
         url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         resp = requests.post(url, json={
             "chat_id":    CHAT_ID,
-            "text":       pesan,
-            "parse_mode": "Markdown"
+            "text":       teks,
+            "parse_mode": "HTML"
         }, timeout=10)
         if resp.status_code == 200:
             logger.info("[Telegram] Pesan terkirim")
             return True
-        else:
-            logger.error(f"[Telegram] Gagal: {resp.text}")
-            return False
+        logger.error(f"[Telegram] Gagal: {resp.text}")
+        return False
     except Exception as e:
         logger.error(f"[Telegram] Error: {e}")
         return False
 
 # ================================================================
-# NOTIFIKASI INISIALISASI — kirim saat server pertama hidup
+# TEMPLATE NOTIFIKASI — SESUAI FORMAT LAPORAN
 # ================================================================
-def notif_sistem_hidup():
-    waktu = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+def notif_sistem_aktif():
     pesan = (
-        f"✅ *SISTEM MONITORING AKTIF*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🐟 Monitoring kualitas air ikan discus\n"
-        f"🤖 Model XGBoost: *loaded*\n"
-        f"🗄 Database: *Supabase connected*\n"
-        f"⏱ Interval baca: *2 menit*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 Waktu aktif: {waktu}"
+        "SISTEM AKTIF\n"
+        "Status  : Sistem monitoring kualitas air aktif\n"
+        "Server  : Terhubung"
     )
     kirim_telegram_pesan(pesan)
 
+def pesan_kondisi_waspada(suhu, ph, turb, penyebab):
+    return (
+        "PERINGATAN KUALITAS AIR\n"
+        "Status    : WASPADA\n"
+        f"Suhu      : {suhu:.2f} °C\n"
+        f"pH        : {ph:.2f}\n"
+        f"Turbidity : {turb:.2f}\n"
+        f"Penyebab  : {penyebab}\n"
+        "Tindakan  : Sistem mengirim peringatan kepada pengguna"
+    )
+
+def pesan_kondisi_bahaya(suhu, ph, turb, penyebab, aksi):
+    return (
+        "PERINGATAN KUALITAS AIR\n"
+        "Status     : BAHAYA\n"
+        f"Suhu       : {suhu:.2f} °C\n"
+        f"pH         : {ph:.2f}\n"
+        f"Turbidity  : {turb:.2f}\n"
+        f"Penyebab   : {penyebab}\n"
+        f"Aksi       : {aksi}"
+    )
+
+def pesan_aktuator_on(nama_aktuator, pemicu):
+    return (
+        "AKTUATOR AKTIF\n"
+        f"Aktuator   : {nama_aktuator}\n"
+        f"Pemicu     : {pemicu}\n"
+        "Mode       : Otomatis\n"
+        "Status     : ON"
+    )
+
+def pesan_aktuator_off(nama_aktuator):
+    return (
+        "AKTUATOR NONAKTIF\n"
+        f"Aktuator   : {nama_aktuator}\n"
+        "Mode       : Otomatis\n"
+        "Status     : OFF"
+    )
+
 # Kirim notifikasi sistem hidup saat server start
-notif_sistem_hidup()
+notif_sistem_aktif()
 
 # ================================================================
-# FUNGSI SIMPAN KE SUPABASE
+# DETEKSI PENYEBAB SPESIFIK (RULE-BASED)
+# XGBoost hanya memberi status; fungsi ini memakai nilai mentah
+# untuk menentukan penyebab + aktuator target.
+# Return: (penyebab, aktuator_key, nama_aktuator)
+#   aktuator_key = None  -> tidak ada aktuator (hanya peringatan)
+# ================================================================
+def deteksi_penyebab(suhu, ph, turb, label):
+    # ---- Threshold keras (kondisi bahaya, memicu aktuator) ----
+    if ph < PH_ASAM:
+        return ("pH terlalu asam", "pompa_basa", "Pompa buffer basa")
+    if ph > PH_BASA:
+        return ("pH terlalu basa", "pompa_asam", "Pompa buffer asam")
+    if suhu < SUHU_MIN:
+        return ("Suhu terlalu dingin", "heater", "Heater")
+    if suhu > SUHU_MAX:
+        return ("Suhu terlalu panas", None, "-")
+    if turb > TURB_MAX:
+        return ("Turbidity melewati batas", None, "-")
+
+    # ---- Threshold lunak (mulai menyimpang, hanya peringatan) ----
+    if ph <= PH_ASAM_WASPADA or ph >= PH_BASA_WASPADA:
+        return ("pH mulai menyimpang", None, "-")
+    if suhu <= SUHU_MIN_WASPADA or suhu >= SUHU_MAX_WASPADA:
+        return ("Suhu mulai menyimpang", None, "-")
+    if turb >= TURB_WASPADA:
+        return ("Turbidity mulai menyimpang", None, "-")
+
+    return ("Parameter mendekati batas normal", None, "-")
+
+# ================================================================
+# NOTIFIKASI KONDISI (dengan cooldown per label)
+# ================================================================
+def kirim_notif_kondisi(label, suhu, ph, turb, penyebab, aksi):
+    sekarang = datetime.now().timestamp()
+    terakhir = last_notif_time.get(label, 0)
+    cooldown = COOLDOWN.get(label, 120)
+
+    if cooldown > 0 and (sekarang - terakhir) < cooldown:
+        sisa = int(cooldown - (sekarang - terakhir))
+        logger.info(f"[Telegram] Cooldown {label} — {sisa}s tersisa")
+        return False
+
+    if label == "Waspada":
+        pesan = pesan_kondisi_waspada(suhu, ph, turb, penyebab)
+    else:  # Bahaya
+        pesan = pesan_kondisi_bahaya(suhu, ph, turb, penyebab, aksi)
+
+    if kirim_telegram_pesan(pesan):
+        last_notif_time[label] = sekarang
+        return True
+    return False
+
+# ================================================================
+# NOTIFIKASI AKTUATOR — hanya saat TRANSISI status logis
+# ================================================================
+def proses_notif_aktuator(aktuator_baru, pemicu):
+    for key, val in aktuator_baru.items():
+        lama = status_aktuator.get(key, False)
+        if val and not lama:
+            kirim_telegram_pesan(pesan_aktuator_on(NAMA_AKTUATOR[key], pemicu))
+        elif (not val) and lama:
+            kirim_telegram_pesan(pesan_aktuator_off(NAMA_AKTUATOR[key]))
+        status_aktuator[key] = val
+
+# ================================================================
+# SIMPAN KE SUPABASE
 # ================================================================
 def simpan_supabase(ts, suhu, ph, turb, label, prob_dict):
     url     = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
@@ -135,85 +273,11 @@ def simpan_supabase(ts, suhu, ph, turb, label, prob_dict):
         if resp.status_code in [200, 201]:
             logger.info(f"[Supabase] Tersimpan: {label}")
             return True
-        else:
-            logger.error(f"[Supabase] Gagal: {resp.status_code} — {resp.text}")
-            return False
+        logger.error(f"[Supabase] Gagal: {resp.status_code} — {resp.text}")
+        return False
     except Exception as e:
         logger.error(f"[Supabase] Error: {e}")
         return False
-
-# ================================================================
-# FUNGSI KIRIM NOTIFIKASI KONDISI AIR
-# ================================================================
-def kirim_notif_kondisi(label, suhu, ph, turb, prob):
-    global last_notif_time
-
-    sekarang = datetime.now().timestamp()
-    terakhir = last_notif_time.get(label, 0)
-    cooldown = COOLDOWN.get(label, 120)
-
-    # Cek cooldown
-    if cooldown > 0 and (sekarang - terakhir) < cooldown:
-        sisa = int(cooldown - (sekarang - terakhir))
-        logger.info(f"[Telegram] Cooldown {label} — {sisa}s tersisa")
-        return False
-
-    notif_count[label] = notif_count.get(label, 0) + 1
-    waktu_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    emoji = "⚠️" if label == "Waspada" else "🚨"
-    judul = "PERINGATAN KUALITAS AIR" if label == "Waspada" else "BAHAYA KUALITAS AIR"
-
-    pesan = (
-        f"{emoji} *{judul}*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🌡 Suhu      : *{suhu:.2f} °C*\n"
-        f"🧪 pH        : *{ph:.3f}*\n"
-        f"💧 Turbidity : *{turb:.2f} NTU*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Probabilitas:\n"
-        f"   Aman     : {prob.get('Aman',0)*100:.1f}%\n"
-        f"   Waspada  : {prob.get('Waspada',0)*100:.1f}%\n"
-        f"   Bahaya   : {prob.get('Bahaya',0)*100:.1f}%\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 Waktu : {waktu_str}\n"
-        f"⚡ Alert ke-{notif_count[label]}"
-    )
-
-    hasil = kirim_telegram_pesan(pesan)
-    if hasil:
-        last_notif_time[label] = sekarang
-    return hasil
-
-# ================================================================
-# FUNGSI NOTIFIKASI AKTUATOR
-# ================================================================
-def notif_aktuator(aktuator_baru):
-    global status_aktuator
-
-    perubahan = []
-    nama_map  = {
-        "pompa_kuras": "Pompa Kuras",
-        "pompa_isi":   "Pompa Isi",
-        "heater":      "Heater",
-        "filter":      "Filter"
-    }
-
-    for key, val in aktuator_baru.items():
-        if val != status_aktuator.get(key, False):
-            status = "🟢 ON" if val else "🔴 OFF"
-            perubahan.append(f"  {nama_map.get(key, key)}: *{status}*")
-        status_aktuator[key] = val
-
-    if perubahan:
-        waktu_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        pesan = (
-            f"⚙️ *PERUBAHAN AKTUATOR*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            + "\n".join(perubahan) +
-            f"\n━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {waktu_str}"
-        )
-        kirim_telegram_pesan(pesan)
 
 # ================================================================
 # ENDPOINT UTAMA — TERIMA DATA DARI ESP32
@@ -244,67 +308,62 @@ def terima_data():
     if turb < 0:
         return jsonify({"status": "skip", "msg": "turbidity negatif"}), 200
 
-    # 4 — Prediksi XGBoost
+    # 4 — Prediksi XGBoost (STATUS saja)
     if model is None:
         return jsonify({"status": "error", "msg": "model tidak tersedia"}), 500
-
     try:
-        X        = [[suhu, ph, turb]]
-        pred_enc = model.predict(X)[0]
-        prob_arr = model.predict_proba(X)[0]
-        label    = encoder.inverse_transform([pred_enc])[0]
-        prob_dict = {
-            kls: float(prob_arr[i])
-            for i, kls in enumerate(encoder.classes_)
-        }
+        X         = [[suhu, ph, turb]]
+        pred_enc  = model.predict(X)[0]
+        prob_arr  = model.predict_proba(X)[0]
+        label     = encoder.inverse_transform([pred_enc])[0]
+        prob_dict = {kls: float(prob_arr[i]) for i, kls in enumerate(encoder.classes_)}
     except Exception as e:
         logger.error(f"Prediksi error: {e}")
         return jsonify({"status": "error", "msg": str(e)}), 500
 
+    # 5 — Deteksi penyebab spesifik (RULE-BASED)
+    penyebab, akt_key, akt_nama = deteksi_penyebab(suhu, ph, turb, label)
+
     logger.info(
-        f"[{ts}] suhu={suhu} pH={ph} turb={turb} → {label} "
+        f"[{ts}] suhu={suhu} pH={ph} turb={turb} -> {label} | penyebab={penyebab} "
         f"(A:{prob_dict.get('Aman',0):.2f} "
         f"W:{prob_dict.get('Waspada',0):.2f} "
         f"B:{prob_dict.get('Bahaya',0):.2f})"
     )
 
-    # 5 — Simpan ke Supabase
+    # 6 — Simpan ke Supabase
     simpan_supabase(ts, suhu, ph, turb, label, prob_dict)
 
-    # 6 — Tentukan perintah aktuator
-    aktuator = {
-        "pompa_kuras": label == "Bahaya",
-        "pompa_isi":   label == "Bahaya",
-        "heater":      suhu < 25.0,
-        "filter":      label in ["Waspada", "Bahaya"]
-    }
+    # 7 — Tentukan aktuator. Aktuator hanya aktif saat BAHAYA +
+    #     threshold keras terlewati (deteksi_penyebab memberi akt_key).
+    aktuator = {"pompa_asam": False, "pompa_basa": False, "heater": False}
+    if label == "Bahaya" and akt_key in aktuator:
+        aktuator[akt_key] = True
 
-    # 7 — Kirim notifikasi kondisi + notifikasi perubahan aktuator
-    notif_terkirim = False
-    if label in ["Waspada", "Bahaya"]:
-        notif_terkirim = kirim_notif_kondisi(
-            label, suhu, ph, turb, prob_dict
-        )
-        # Kirim notif perubahan aktuator jika ada yang berubah
-        notif_aktuator(aktuator)
+    # 8 — Notifikasi kondisi (Waspada/Bahaya)
+    if label == "Bahaya":
+        aksi = f"{akt_nama} diaktifkan" if akt_key else "Sistem mengirim peringatan kepada pengguna"
+        kirim_notif_kondisi(label, suhu, ph, turb, penyebab, aksi)
+    elif label == "Waspada":
+        kirim_notif_kondisi(label, suhu, ph, turb, penyebab, None)
 
-    else:
-        # Kondisi kembali Aman — kirim notif aktuator jika ada yang dimatikan
-        notif_aktuator(aktuator)
+    # 9 — Notifikasi aktuator (hanya saat transisi ON/OFF)
+    proses_notif_aktuator(aktuator, penyebab)
 
-    # 8 — Kembalikan respons ke ESP32
+    # 10 — Respons ke ESP32
+    #      dosing_detik = durasi pulsa pompa buffer yang dieksekusi ESP32
     return jsonify({
-        "status":         "ok",
-        "prediksi":       label,
-        "probabilitas":   {k: round(v, 4) for k, v in prob_dict.items()},
-        "aktuator":       aktuator,
-        "notif_terkirim": notif_terkirim,
-        "timestamp":      ts
+        "status":       "ok",
+        "prediksi":     label,
+        "probabilitas": {k: round(v, 4) for k, v in prob_dict.items()},
+        "penyebab":     penyebab,
+        "aktuator":     aktuator,
+        "dosing_detik": DOSING_DETIK,
+        "timestamp":    ts
     }), 200
 
 # ================================================================
-# ENDPOINT AKTUATOR MANUAL DARI BLYNK / USER
-# Endpoint ini dipanggil jika kamu ingin log aktuator manual
+# ENDPOINT AKTUATOR MANUAL (opsional, dari Blynk/user)
 # ================================================================
 @app.route("/aktuator", methods=["POST"])
 def aktuator_manual():
@@ -314,16 +373,11 @@ def aktuator_manual():
 
     nama   = data.get("nama", "unknown")
     state  = data.get("state", False)
-    waktu  = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    status = "🟢 ON" if state else "🔴 OFF"
-
     pesan = (
-        f"🖐 *KONTROL MANUAL*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ {nama}: *{status}*\n"
-        f"👤 Dikendalikan manual via Blynk\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {waktu}"
+        "KONTROL MANUAL\n"
+        f"Aktuator : {nama}\n"
+        f"Mode     : Manual\n"
+        f"Status   : {'ON' if state else 'OFF'}"
     )
     kirim_telegram_pesan(pesan)
     return jsonify({"status": "ok"}), 200
@@ -366,10 +420,7 @@ def last_data():
     try:
         url     = (f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
                    f"?select=*&order=created_at.desc&limit=1")
-        headers = {
-            "apikey":        SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}"
-        }
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
             hasil = resp.json()
@@ -387,10 +438,7 @@ def history():
     try:
         url     = (f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
                    f"?select=*&order=created_at.desc&limit={limit}")
-        headers = {
-            "apikey":        SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}"
-        }
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
             return jsonify(resp.json()), 200
